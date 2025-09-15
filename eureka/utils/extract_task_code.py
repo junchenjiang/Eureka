@@ -9,28 +9,32 @@ def extract_task_code(filename):
     in_task = False
     task_string = ''
     reward_string = ''
-    with open(filename, 'r') as file:
-        for line in file:
-            # Skip leading comments (lines starting with '#')
-            if not in_code and line.lstrip().startswith('#'):
-                continue
-            
-            # Start adding lines to code_string once we've found a non-commented line
-            if not in_code and not line.lstrip().startswith('#'):
-                in_code = True
-                in_task = True
-            # Stop adding lines once we've found a line with multiple '#'
-            if in_code and line.count('#') > 1:
-                in_task = False
-                continue
-                # reward_string += line
-                # break
-            
-            # Add line to code_string
-            if in_code and in_task:
-                task_string += line
-            else:
-                reward_string += line    
+    try:
+        with open(filename, 'r') as file:
+            for line in file:
+                # Skip leading comments (lines starting with '#')
+                if not in_code and line.lstrip().startswith('#'):
+                    continue
+                
+                # Start adding lines to code_string once we've found a non-commented line
+                if not in_code and not line.lstrip().startswith('#'):
+                    in_code = True
+                    in_task = True
+                # Stop adding lines once we've found a line with multiple '#'
+                if in_code and line.count('#') > 1:
+                    in_task = False
+                    continue
+                    # reward_string += line
+                    # break
+                
+                # Add line to code_string
+                if in_code and in_task:
+                    task_string += line
+                else:
+                    reward_string += line    
+    except Exception as e:
+        print(f"[extract_task_code] Error parsing {filename}: {e}")
+        return '', ''
     return task_string, reward_string
 
 def extract_observation_code(filename):

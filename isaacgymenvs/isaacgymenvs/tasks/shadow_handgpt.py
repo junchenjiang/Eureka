@@ -367,7 +367,7 @@ class ShadowHandGPT(VecTask):
         self.goal_object_indices = to_torch(self.goal_object_indices, dtype=torch.long, device=self.device)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.object_rot, self.goal_rot, self.fingertip_pos, self.object_pos)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.object_rot, self.goal_rot, self.object_angvel, self.object_pos, self.fingertip_pos, self.actions)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.rew_buf[:] = compute_bonus(
@@ -763,32 +763,80 @@ import math
 import torch
 from torch import Tensor
 @torch.jit.script
-def compute_reward(object_rot: torch.Tensor, goal_rot: torch.Tensor, fingertip_pos: torch.Tensor, object_pos: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    device = object_rot.device
-    
-    # Distance between object rotation and goal rotation
-    object_goal_rot_diff = torch.norm(object_rot - goal_rot, dim=1)
-    
-    # Distance between each fingertip and the object
-    fingertip_object_diff = torch.norm(fingertip_pos - object_pos.unsqueeze(1), dim=2)
-    avg_fingertip_object_diff = fingertip_object_diff.mean(dim=1)
-    
-    # Reward Components
-    rot_reward = -object_goal_rot_diff
-    fingertip_reward = -avg_fingertip_object_diff
-    
-    # Temperature parameters for reward normalization
-    rot_temperature = torch.tensor(1.0).to(device)
-    fingertip_temperature = torch.tensor(1.0).to(device)
-    
-    # Normalize reward components using exponential function
-    rot_reward_normalized = torch.exp(rot_reward / rot_temperature)
-    fingertip_reward_normalized = torch.exp(fingertip_reward / fingertip_temperature)
-    
-    # Combine normalized rewards
-    total_reward = rot_reward_normalized + fingertip_reward_normalized
-    
-    # Store individual reward components in a dictionary
-    reward_dict = {"rot_reward": rot_reward_normalized, "fingertip_reward": fingertip_reward_normalized}
-    
-    return total_reward, reward_dict
+def compute_reward(
+    object_rot: torch.Tensor,          # [num_envs, 4]
+    goal_rot: torch.Tensor,            # [num_envs, 4]
+    object_angvel: torch.Tensor,       # [num_envs, 3]
+    object_pos: torch.Tensor,          # [num_envs, 3]
+    fingertip_pos: torch.Tensor,       # [num_envs, num_fingertips, 3]
+    actions: torch.Tensor              # [num_envs, num_actions]
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    # Temperatures for transformed components (as required, each has its own)
+    tau_align = 0.5         # affects sharpness of orientation alignment shaping
+    tau_contact = 0.03      # meters scale for fingertip-object proximity shaping
+    tau_gate = 0.5          # gates angular velocity penalty as alignment improves
+
+    # Weights
+    w_align = 2.5
+    w_contact = 0.2
+    w_angvel = 0.1
+    w_act = 0.005
+    bonus_scale = 2.0
+    success_angle = 0.12     # radians (~6.9 degrees)
+    eps = 1e-8
+
+    # Normalize quaternions to avoid numerical errors
+    o_norm = torch.norm(object_rot, dim=1, keepdim=True).clamp_min(eps)
+    g_norm = torch.norm(goal_rot, dim=1, keepdim=True).clamp_min(eps)
+    o_q = object_rot / o_norm
+    g_q = goal_rot / g_norm
+
+    # Quaternion distance via absolute dot product (double cover)
+    # theta = 2 * acos(|dot(q_obj, q_goal)|)
+    dot = torch.sum(o_q * g_q, dim=1).clamp(-1.0, 1.0)
+    dot_abs = torch.abs(dot).clamp(0.0, 1.0)
+    theta = 2.0 * torch.acos(dot_abs)
+
+    # Orientation alignment shaping: exp(-theta^2 / tau_align)
+    reward_align = torch.exp(-(theta * theta) / tau_align)
+
+    # Fingertip proximity shaping: use min fingertip->object distance
+    # reward_contact = exp(-min_dist / tau_contact)
+    rel = fingertip_pos - object_pos.unsqueeze(1)  # [N, F, 3]
+    dists = torch.norm(rel, dim=2)                 # [N, F]
+    min_dist, _ = torch.min(dists, dim=1)          # [N]
+    reward_contact = torch.exp(-min_dist / tau_contact)
+
+    # Angular velocity penalty, gated to matter more near the goal
+    angvel_norm = torch.norm(object_angvel, dim=1)       # [N]
+    gate = torch.exp(-theta / tau_gate)                  # [N]
+    pen_angvel = gate * angvel_norm                       # [N], higher near goal
+
+    # Action regularization penalty
+    pen_act = torch.mean(actions * actions, dim=1)       # [N]
+
+    # Success bonus when within threshold angle
+    success_mask = (theta < success_angle).to(object_rot.dtype)
+    success_bonus = success_mask * bonus_scale
+
+    # Total reward
+    reward = (
+        w_align * reward_align
+        + w_contact * reward_contact
+        - w_angvel * pen_angvel
+        - w_act * pen_act
+        + success_bonus
+    )
+
+    # Components dictionary
+    components: Dict[str, torch.Tensor] = {}
+    components["reward_align"] = reward_align
+    components["reward_contact"] = reward_contact
+    components["pen_angvel"] = pen_angvel
+    components["pen_act"] = pen_act
+    components["success_bonus"] = success_bonus
+    components["theta"] = theta
+    components["min_fingertip_dist"] = min_dist
+    components["angvel_norm"] = angvel_norm
+
+    return reward, components
