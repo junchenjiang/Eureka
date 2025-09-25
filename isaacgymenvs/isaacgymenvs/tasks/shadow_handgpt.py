@@ -367,7 +367,7 @@ class ShadowHandGPT(VecTask):
         self.goal_object_indices = to_torch(self.goal_object_indices, dtype=torch.long, device=self.device)
 
     def compute_reward(self, actions):
-        self.rew_buf[:], self.rew_dict = compute_reward(self.object_rot, self.goal_rot, self.object_angvel, self.object_pos, self.fingertip_pos, self.actions)
+        self.rew_buf[:], self.rew_dict = compute_reward(self.object_rot, self.goal_rot, self.object_angvel, self.object_pos, self.goal_pos)
         self.extras['gpt_reward'] = self.rew_buf.mean()
         for rew_state in self.rew_dict: self.extras[rew_state] = self.rew_dict[rew_state].mean()
         self.rew_buf[:] = compute_bonus(
@@ -764,79 +764,150 @@ import torch
 from torch import Tensor
 @torch.jit.script
 def compute_reward(
-    object_rot: torch.Tensor,          # [num_envs, 4]
-    goal_rot: torch.Tensor,            # [num_envs, 4]
-    object_angvel: torch.Tensor,       # [num_envs, 3]
-    object_pos: torch.Tensor,          # [num_envs, 3]
-    fingertip_pos: torch.Tensor,       # [num_envs, num_fingertips, 3]
-    actions: torch.Tensor              # [num_envs, num_actions]
+    object_rot: torch.Tensor,
+    goal_rot: torch.Tensor,
+    object_angvel: torch.Tensor,
+    object_pos: torch.Tensor,
+    goal_pos: torch.Tensor
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-    # Temperatures for transformed components (as required, each has its own)
-    tau_align = 0.5         # affects sharpness of orientation alignment shaping
-    tau_contact = 0.03      # meters scale for fingertip-object proximity shaping
-    tau_gate = 0.5          # gates angular velocity penalty as alignment improves
+    device = object_rot.device
+    dtype = object_rot.dtype
 
-    # Weights
-    w_align = 2.5
-    w_contact = 0.2
-    w_angvel = 0.1
-    w_act = 0.005
-    bonus_scale = 2.0
-    success_angle = 0.12     # radians (~6.9 degrees)
-    eps = 1e-8
+    eps = torch.tensor(1e-8, device=device, dtype=dtype)
+    pi_t = torch.tensor(3.141592653589793, device=device, dtype=dtype)
 
-    # Normalize quaternions to avoid numerical errors
-    o_norm = torch.norm(object_rot, dim=1, keepdim=True).clamp_min(eps)
-    g_norm = torch.norm(goal_rot, dim=1, keepdim=True).clamp_min(eps)
-    o_q = object_rot / o_norm
-    g_q = goal_rot / g_norm
+    # Normalize quaternions to be safe
+    q_obj = object_rot / torch.clamp(torch.norm(object_rot, dim=-1, keepdim=True), min=eps)
+    q_goal = goal_rot / torch.clamp(torch.norm(goal_rot, dim=-1, keepdim=True), min=eps)
 
-    # Quaternion distance via absolute dot product (double cover)
-    # theta = 2 * acos(|dot(q_obj, q_goal)|)
-    dot = torch.sum(o_q * g_q, dim=1).clamp(-1.0, 1.0)
-    dot_abs = torch.abs(dot).clamp(0.0, 1.0)
-    theta = 2.0 * torch.acos(dot_abs)
+    # Relative quaternion q_rel = q_goal * conj(q_obj)
+    v1 = q_goal[:, 0:3]
+    w1 = q_goal[:, 3:4]
+    v2 = -q_obj[:, 0:3]  # conj(q_obj).xyz
+    w2 = q_obj[:, 3:4]   # conj(q_obj).w
+    cross_v = torch.cross(v1, v2, dim=-1)
+    q_rel_v = w1 * v2 + w2 * v1 + cross_v
+    q_rel_w = w1 * w2 - torch.sum(v1 * v2, dim=-1, keepdim=True)
 
-    # Orientation alignment shaping: exp(-theta^2 / tau_align)
-    reward_align = torch.exp(-(theta * theta) / tau_align)
+    # Ensure shortest arc (q and -q represent same rotation)
+    sign = torch.sign(q_rel_w)
+    sign = torch.where(sign == 0.0, torch.ones_like(sign), sign)
+    q_rel_v = q_rel_v * sign
+    q_rel_w = q_rel_w * sign
 
-    # Fingertip proximity shaping: use min fingertip->object distance
-    # reward_contact = exp(-min_dist / tau_contact)
-    rel = fingertip_pos - object_pos.unsqueeze(1)  # [N, F, 3]
-    dists = torch.norm(rel, dim=2)                 # [N, F]
-    min_dist, _ = torch.min(dists, dim=1)          # [N]
-    reward_contact = torch.exp(-min_dist / tau_contact)
+    # Orientation error angle in [0, pi]
+    q_rel_w_clamped = torch.clamp(q_rel_w.squeeze(-1), min=-1.0, max=1.0)
+    ang_err = 2.0 * torch.acos(q_rel_w_clamped)
 
-    # Angular velocity penalty, gated to matter more near the goal
-    angvel_norm = torch.norm(object_angvel, dim=1)       # [N]
-    gate = torch.exp(-theta / tau_gate)                  # [N]
-    pen_angvel = gate * angvel_norm                       # [N], higher near goal
+    # Rotation axis (unit, arbitrary when angle ~ 0)
+    axis = q_rel_v
+    axis_norm = torch.clamp(torch.norm(axis, dim=-1, keepdim=True), min=eps)
+    unit_axis = axis / axis_norm
 
-    # Action regularization penalty
-    pen_act = torch.mean(actions * actions, dim=1)       # [N]
+    # Gates for far/near regimes
+    far_gate_temp = torch.tensor(1.2, device=device, dtype=dtype)
+    angle_gate_far = 1.0 - torch.exp(-far_gate_temp * ang_err)   # ~1 when far, ~0 near
+    near_gate_temp = torch.tensor(3.0, device=device, dtype=dtype)
+    near_goal_gate = torch.exp(-near_gate_temp * ang_err)        # ~1 near, ~0 far
 
-    # Success bonus when within threshold angle
-    success_mask = (theta < success_angle).to(object_rot.dtype)
-    success_bonus = success_mask * bonus_scale
+    # 1) Orientation alignment potentials
+    # Cosine potential (smooth and high curvature at mid-range)
+    ori_cos = 0.5 * (torch.cos(ang_err) + 1.0)  # in [0,1]
+    # Gaussian in angle^2 (strong pull near target)
+    ori_gauss_temp = torch.tensor(1.2, device=device, dtype=dtype)
+    ori_gauss = torch.exp(-ori_gauss_temp * (ang_err * ang_err))
+    # Linear coarse shaping
+    ori_linear = torch.clamp(1.0 - ang_err / pi_t, min=0.0, max=1.0)
 
-    # Total reward
-    reward = (
-        w_align * reward_align
-        + w_contact * reward_contact
-        - w_angvel * pen_angvel
-        - w_act * pen_act
-        + success_bonus
+    # 2) Proportional target spin speed along the error axis
+    kp_speed = torch.tensor(2.5, device=device, dtype=dtype)     # rad/s per rad of error
+    max_speed = torch.tensor(3.0, device=device, dtype=dtype)    # achievable cap
+    desired_mag = torch.clamp(kp_speed * ang_err, max=max_speed)
+
+    proj_along = torch.sum(object_angvel * unit_axis, dim=-1)    # signed component along axis
+    speed_err_abs = torch.abs(proj_along - desired_mag)
+    speed_track_temp = torch.tensor(1.2, device=device, dtype=dtype)
+    av_speed_track = torch.exp(-speed_track_temp * speed_err_abs)
+
+    # 3) Directional progress reward (encourage angle decrease), active when far
+    prog_temp = torch.tensor(1.5, device=device, dtype=dtype)
+    progress_reward = angle_gate_far * (1.0 - torch.exp(-prog_temp * torch.relu(proj_along)))
+
+    # 4) Penalize rotating the wrong way (only when far)
+    wrong_dir_temp = torch.tensor(1.0, device=device, dtype=dtype)
+    wrong_dir_penalty = -angle_gate_far * (1.0 - torch.exp(-wrong_dir_temp * torch.relu(-proj_along)))
+
+    # 5) Penalize off-axis spin via perpendicular angular velocity magnitude
+    angvel_mag = torch.norm(object_angvel, dim=-1)
+    proj_sq = proj_along * proj_along
+    angvel_mag_sq = torch.sum(object_angvel * object_angvel, dim=-1)
+    perp_sq = torch.clamp(angvel_mag_sq - proj_sq, min=0.0)
+    perp_mag = torch.sqrt(perp_sq + eps)
+    offaxis_temp = torch.tensor(1.5, device=device, dtype=dtype)
+    off_axis_penalty = -(1.0 - torch.exp(-offaxis_temp * perp_mag)) * (0.5 + 0.5 * near_goal_gate)
+
+    # 6) Position stability (near-goal only)
+    pos_diff = object_pos - goal_pos
+    pos_err = torch.norm(pos_diff, dim=-1)
+    pos_temp = torch.tensor(5.0, device=device, dtype=dtype)
+    pos_reward = near_goal_gate * torch.exp(-pos_temp * pos_err)
+
+    # 7) Success-and-stop bonus (aligned and not spinning)
+    succ_angle_temp = torch.tensor(6.0, device=device, dtype=dtype)
+    succ_speed_temp = torch.tensor(1.0, device=device, dtype=dtype)
+    success_bonus = torch.exp(-succ_angle_temp * ang_err) * torch.exp(-succ_speed_temp * angvel_mag)
+
+    # 8) Near-goal brake penalty (discourage residual spin when aligned)
+    brake_angle_temp = torch.tensor(6.0, device=device, dtype=dtype)
+    brake_speed_temp = torch.tensor(1.5, device=device, dtype=dtype)
+    near_goal_brake_penalty = -(1.0 - torch.exp(-brake_speed_temp * angvel_mag)) * torch.exp(-brake_angle_temp * ang_err)
+
+    # Weights (balanced to avoid any component dominating)
+    w_ori_cos = torch.tensor(0.6, device=device, dtype=dtype)
+    w_ori_gauss = torch.tensor(1.2, device=device, dtype=dtype)
+    w_ori_linear = torch.tensor(0.4, device=device, dtype=dtype)
+
+    w_av_speed = torch.tensor(1.2, device=device, dtype=dtype)
+    w_progress = torch.tensor(0.8, device=device, dtype=dtype)
+    w_wrong_dir = torch.tensor(0.4, device=device, dtype=dtype)
+    w_off_axis = torch.tensor(0.2, device=device, dtype=dtype)
+
+    w_pos = torch.tensor(0.05, device=device, dtype=dtype)
+    w_success = torch.tensor(3.0, device=device, dtype=dtype)
+    w_brake = torch.tensor(0.6, device=device, dtype=dtype)
+
+    total_reward = (
+        w_ori_cos * ori_cos +
+        w_ori_gauss * ori_gauss +
+        w_ori_linear * ori_linear +
+        w_av_speed * av_speed_track +
+        w_progress * progress_reward +
+        w_wrong_dir * wrong_dir_penalty +
+        w_off_axis * off_axis_penalty +
+        w_pos * pos_reward +
+        w_success * success_bonus +
+        w_brake * near_goal_brake_penalty
     )
 
-    # Components dictionary
     components: Dict[str, torch.Tensor] = {}
-    components["reward_align"] = reward_align
-    components["reward_contact"] = reward_contact
-    components["pen_angvel"] = pen_angvel
-    components["pen_act"] = pen_act
+    # Orientation
+    components["ori_cos"] = ori_cos
+    components["ori_gauss"] = ori_gauss
+    components["ori_linear"] = ori_linear
+    # Velocity shaping
+    components["av_speed_track"] = av_speed_track
+    components["progress_reward"] = progress_reward
+    components["wrong_dir_penalty"] = wrong_dir_penalty
+    components["off_axis_penalty"] = off_axis_penalty
+    # Stability and success
+    components["pos_reward"] = pos_reward
     components["success_bonus"] = success_bonus
-    components["theta"] = theta
-    components["min_fingertip_dist"] = min_dist
-    components["angvel_norm"] = angvel_norm
+    components["near_goal_brake_penalty"] = near_goal_brake_penalty
+    # Diagnostics
+    components["angle_error"] = ang_err
+    components["desired_speed"] = desired_mag
+    components["proj_along_mag"] = proj_along
+    components["perp_angvel_mag"] = perp_mag
+    components["angvel_mag"] = angvel_mag
 
-    return reward, components
+    return total_reward, components

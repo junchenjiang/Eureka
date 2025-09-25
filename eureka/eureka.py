@@ -315,7 +315,7 @@ def main(cfg):
         logging.info(f"Iteration {iter}: User Content:\n" + best_content + "\n")
 
         # Plot the success rate
-        fig, axs = plt.subplots(2, figsize=(6, 6))
+        fig, axs = plt.subplots(3, figsize=(6, 9))
         fig.suptitle(f'{cfg.env.task}')
 
         x_axis = np.arange(len(max_successes))
@@ -327,6 +327,10 @@ def main(cfg):
         axs[1].plot(x_axis, np.array(execute_rates))
         axs[1].set_title("Execute Rate")
         axs[1].set_xlabel("Iteration")
+
+        axs[2].plot(x_axis, np.array(max_successes_reward_correlation))
+        axs[2].set_title("Max Success Reward Correlation")
+        axs[2].set_xlabel("Iteration")
 
         fig.tight_layout(pad=3.0)
         plt.savefig('summary.png')
